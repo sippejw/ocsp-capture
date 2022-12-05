@@ -1,2 +1,2 @@
-# tap-base
-Template for future tap projects.
+# ocsp-capture
+A tool for parsing OCSP packets to validate signatures.

@@ -2,6 +2,7 @@ mod flow_tracker;
 mod cache;
 mod common;
 mod stats_tracker;
+mod ocsp_struct;
 
 use libc::{size_t, c_char};
 use pnet::packet::{ethernet::{EthernetPacket, EtherTypes}, Packet};

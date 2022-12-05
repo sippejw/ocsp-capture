@@ -2,6 +2,7 @@ mod flow_tracker;
 mod common;
 mod cache;
 mod stats_tracker;
+mod ocsp_struct;
 
 extern crate env_logger;
 extern crate clap;

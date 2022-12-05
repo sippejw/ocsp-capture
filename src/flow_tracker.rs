@@ -4,6 +4,8 @@ extern crate postgres;
 use std::ops::Sub;
 use std::time::{Duration, Instant};
 use std::collections::{HashSet, VecDeque};
+use aes::cipher::typenum::private::IsGreaterPrivate;
+use clap::Error;
 use pnet::packet::ethernet::{EthernetPacket, EtherTypes};
 use pnet::packet::ipv6::Ipv6Packet;
 use pnet::packet::udp::UdpPacket;
@@ -22,8 +24,9 @@ use std::fs::OpenOptions;
 use memuse::DynamicUsage;
 
 use crate::cache::{MeasurementCache, MEASUREMENT_CACHE_FLUSH};
+use crate::ocsp_struct::OCSP_MEASURE;
 use crate::stats_tracker::{StatsTracker};
-use crate::common::{TimedFlow, Flow};
+use crate::common::{TimedFlow, Flow, u8_to_u32_be};
 
 pub struct FlowTracker {
     flow_timeout: Duration,
@@ -36,8 +39,6 @@ pub struct FlowTracker {
     stale_udp_drops: VecDeque<TimedFlow>,
     prevented_udp_flows: HashSet<Flow>,
     stale_udp_preventions: VecDeque<TimedFlow>,
-    tracked_quic_conns: HashSet<Flow>,
-    stale_quic_drops: VecDeque<TimedFlow>,
     rand: ThreadRng,
     pub gre_offset: usize,
 }
@@ -55,8 +56,6 @@ impl FlowTracker {
             stale_udp_drops: VecDeque::with_capacity(65536),
             prevented_udp_flows: HashSet::new(),
             stale_udp_preventions: VecDeque::with_capacity(65536),
-            tracked_quic_conns: HashSet::new(),
-            stale_quic_drops: VecDeque::with_capacity(65536),
             rand: rand::thread_rng(),
             gre_offset: gre_offset,
         };
@@ -65,15 +64,6 @@ impl FlowTracker {
             (core_id as i64) * MEASUREMENT_CACHE_FLUSH / (total_cores as i64)
         ));
         ft
-    }
-
-    pub fn log_packet(&mut self, contents: &String, file_path: &str) -> std::io::Result<()> {
-        let mut file = OpenOptions::new()
-        .write(true)
-        .append(true)
-        .open(file_path)?;
-        file.write_all(contents.as_bytes())?;
-        Ok(())
     }
 
     pub fn handle_ipv4_packet(&mut self, eth_pkt: &EthernetPacket) {
@@ -219,9 +209,17 @@ impl FlowTracker {
         }
         if self.tracked_tcp_flows.contains(&flow) {
             // Client data packet
+
         } else if self.tracked_tcp_flows.contains(&flow.reversed_clone()) {
             // Server data packet
         }
+
+        match (tcp_pkt.get_destination(), tcp_pkt.get_source()) {
+            (80, _) => self.handle_http_record(true, source, destination, tcp_pkt.payload(), &flow),
+            (_, 80) => self.handle_http_record(false, source, destination, tcp_pkt.payload(), &flow.reversed_clone()),
+            (_, _) => {},
+        }
+
         // once in a while -- flush everything
         if time::now().to_timespec().sec - self.cache.last_flush.to_timespec().sec >
             MEASUREMENT_CACHE_FLUSH {
@@ -229,13 +227,75 @@ impl FlowTracker {
         }
     }
 
+    fn handle_http_record(&mut self, is_client: bool, source: IpAddr, destination: IpAddr, record: &[u8], flow: &Flow) {
+        if is_client {
+            let mut headers = [httparse::EMPTY_HEADER; 16];
+            let mut req = httparse::Request::new(&mut headers);
+            let res = req.parse(record).unwrap();
+            if res.is_complete() {
+                for header in req.headers.iter() {
+                    if header.name == "Content-Type" && header.value == b"application/ocsp-request" {
+                        self.handle_ocsp_record(true, source, destination, &record[res.unwrap()..], flow);
+                    }
+                }
+            }
+        } else {
+            let mut headers = [httparse::EMPTY_HEADER; 16];
+            let mut resp = httparse::Response::new(&mut headers);
+            let res = resp.parse(record).unwrap();
+            if res.is_complete() {
+                for header in resp.headers.iter() {
+                    if header.name == "Content-Type" && header.value == b"application/ocsp-response" {
+                        self.handle_ocsp_record(false, source, destination, &record[res.unwrap()..], flow);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_ocsp_record(&mut self, is_request: bool, source: IpAddr, destination: IpAddr, record: &[u8], flow: &Flow) {
+        if !is_request {
+            let measurement = OCSP_MEASURE::new(source, destination, record.to_vec());
+            self.cache.add_ocsp_measurement(flow, measurement);
+        }
+    }
+
     pub fn flush_to_db(&mut self) {
+        let ocsp_cache = self.cache.flush_ocsp_measurements();
 
         if self.tcp_dsn != None {
             let tcp_dsn = self.tcp_dsn.clone().unwrap();
             thread::spawn(move || {
                 let inserter_thread_start = time::now();
                 let mut thread_db_conn = Client::connect(&tcp_dsn, NoTls).unwrap();
+                
+                let insert_ocsp = match thread_db_conn.prepare(
+                    "INSERT
+                    INTO ocsp_measurements (
+                        time,
+                        server_ip,
+                        response)
+                    VALUES ($1, $2, $3);"
+                )
+                {
+                    Ok(stmt) => stmt,
+                    Err(e) => {
+                        error!("Preparing insert_ocsp failed: {}", e);
+                        return;
+                    }
+                };
+
+                for (_flow, measurement) in ocsp_cache {
+                    let mut db_ip = None;
+                    if let IpAddr::V4(ipv4) = measurement.server_ip {
+                        let octets = ipv4.octets();
+                        db_ip = Some(u8_to_u32_be(octets[0], octets[1], octets[2], octets[3]));
+                    }
+                    let updated_rows = thread_db_conn.execute(&insert_ocsp, &[&(measurement.time), &(db_ip), &(measurement.response)]);
+                    if updated_rows.is_err() {
+                        error!("Error updating primers: {:?}", updated_rows)
+                    }
+                }
             });
         }
     }
@@ -290,5 +350,14 @@ impl FlowTracker {
         info!("tracked_tcp_flows: {} stale__tcp_drops: {}", self.tracked_tcp_flows.dynamic_usage(), self.stale_tcp_drops.dynamic_usage());
         info!("tracked_udp_flows: {} stale__udp_drops: {}", self.tracked_udp_flows.dynamic_usage(), self.stale_udp_drops.dynamic_usage());
         info!("Size of UDP Preventions: {}, Size of UDP Preventions Flush: {}", self.prevented_udp_flows.dynamic_usage(), self.stale_udp_preventions.dynamic_usage());
+    }
+
+    pub fn log_packet(&mut self, contents: &String, file_path: &str) -> std::io::Result<()> {
+        let mut file = OpenOptions::new()
+        .write(true)
+        .append(true)
+        .open(file_path)?;
+        file.write_all(contents.as_bytes())?;
+        Ok(())
     }
 }
